@@ -8,12 +8,6 @@
 #include <string.h>
 #include <errno.h>
 
-// implement in order:
-// 1. pthread_create()
-// 2. schedule()
-// 3. pthread_exit()
-// 4. pthread_self()
-
 // Registers
 #define JB_RBX 0
 #define JB_RBP 1
@@ -33,7 +27,7 @@ int firstThread = 1;                                                            
 
 struct sigaction signalHandler;                                                             // signal handler for Round Robin
 
-enum threadStatus {running, ready, exited, available};                                      // thread states
+enum threadStatus {RUNNING, READY, EXITED, AVAILABLE, BLOCKED};                                      // thread states
 
 struct threadControlBlock {                                                                 // thread control block
     int id;                                                                                 // thread ID
@@ -56,7 +50,7 @@ int pthread_create(
         int i;              
         for (i = 0; i < MAXTHREADS; i++) {                                                  // initialize values in TCB table
             TCBTable[i].id = i;             
-            TCBTable[i].status = available;             
+            TCBTable[i].status = AVAILABLE;             
         }               
 
         ualarm(QUANTUM, QUANTUM);                                                           // SIGALARM every 50 ms
@@ -67,12 +61,12 @@ int pthread_create(
         sigaction(SIGALRM, &signalHandler, NULL);                                           // handle alarm signal and schedule
              
         firstThread = 0;                                                                    // unset flag 
-        TCBTable[0].status = ready;                                                         // set status of first thread as ready
+        TCBTable[0].status = READY;                                                         // set status of first thread as ready
 
     }                           
 
     pthread_t tidCurrent = 1;
-    while (TCBTable[tidCurrent].status != available) {                                      // iterate through TCB table to find next available thread
+    while (TCBTable[tidCurrent].status != AVAILABLE) {                                      // iterate through TCB table to find next available thread
         if (tidCurrent > MAXTHREADS) {
             perror("ERROR: Reached maximum threads supported\n");                           // error if maximum number of threads exceeded
         }
@@ -97,7 +91,7 @@ int pthread_create(
     TCBTable[tidCurrent].registers[0].__jmpbuf[JB_RSP] = ptr_mangle((long)stackPointer);    
 
     TCBTable[tidCurrent].id = tidCurrent;                                                   // set ID of new thread
-    TCBTable[tidCurrent].status = ready;                                                    // set status to ready
+    TCBTable[tidCurrent].status = READY;                                                    // set status to ready
 
     schedule();                                                                             // call scheduler
 
@@ -105,23 +99,23 @@ int pthread_create(
 }
 
 void schedule() {
-    if (TCBTable[gCurrent].status == running) {                                             // suspend current thread
-        TCBTable[gCurrent].status = ready;                      
+    if (TCBTable[gCurrent].status == RUNNING) {                                             // suspend current thread
+        TCBTable[gCurrent].status = READY;                      
     }
 
     pthread_t tidCurrent = gCurrent + 1;
-    while(TCBTable[tidCurrent].status != ready) {                                           // cycle through TCB table until finding ready thread
+    while(TCBTable[tidCurrent].status != READY) {                                           // cycle through TCB table until finding ready thread
         tidCurrent = (tidCurrent + 1) % MAXTHREADS;
     }
 
     int save = 0;
-    if(TCBTable[gCurrent].status != exited) {
+    if(TCBTable[gCurrent].status != EXITED) {
         save = setjmp(TCBTable[gCurrent].registers);                                        // 
     }
 
     if (!save) {
         gCurrent = tidCurrent;
-        TCBTable[gCurrent].status = running;
+        TCBTable[gCurrent].status = RUNNING;
         longjmp(TCBTable[gCurrent].registers, 1);                                           
     }
 
@@ -130,21 +124,21 @@ void schedule() {
 void exitCleanup() {                                                                        // clean up remaining threads
     int i;
     for (i = 0; i < MAXTHREADS; i++) {                                                      // iterate through TCB table
-        if (TCBTable[i].status == exited) {                                                 // check if thread has exited
+        if (TCBTable[i].status == EXITED) {                                                 // check if thread has exited
             free(TCBTable[i].stack);                                                        // free memory from thread
-            TCBTable[i].status = available;                                                 // set TCB table entry to available
+            TCBTable[i].status = AVAILABLE;                                                 // set TCB table entry to available
         }
     }
 }
 
 void pthread_exit(void *retval) {                                                           // 
-    TCBTable[gCurrent].status = exited; 
+    TCBTable[gCurrent].status = EXITED; 
 
     exitCleanup();                                                                          
 
     int i;  
     for (i = 0; i < MAXTHREADS; i++) {                                                      // call scheduler if any threads are waiting
-        if (TCBTable[i].status == ready) {  
+        if (TCBTable[i].status == READY) {  
             schedule(); 
             break;  
         }   
