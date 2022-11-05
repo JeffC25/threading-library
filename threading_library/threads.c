@@ -7,100 +7,129 @@
 #include <signal.h>
 #include <string.h>
 #include <errno.h>
+#include <semaphore.h>
+
+#define MAXTHREADS  128                                                                      // maximum threads supported
+#define STACKSIZE   32767                                                                    // stack byte size to allocate
+#define QUANTUM     50 * 1000                                                                // 50,000 Us = 50 ms interval
 
 // Registers
-#define JB_RBX 0
-#define JB_RBP 1
-#define JB_R12 2
-#define JB_R13 3
-#define JB_R14 4
-#define JB_R15 5
-#define JB_RSP 6                                                                            // stack pointer
-#define JB_PC 7                                                                             // program counter
+#define JB_RBX  0
+#define JB_RBP  1
+#define JB_R12  2
+#define JB_R13  3
+#define JB_R14  4
+#define JB_R15  5
+#define JB_RSP  6                                                                           // stack pointer
+#define JB_PC   7                                                                           // program counter
 
-#define MAXTHREADS 128                                                                      // maximum threads supported
-#define STACKSIZE 32767                                                                     // stack byte size to allocate
-#define QUANTUM 50 * 1000                                                                   // 50,000 Us = 50 ms interval
-
-pthread_t gCurrent = 0;                                                                     // ID of current running thread
-int firstThread = 1;                                                                        // flag for initializing scheduler
-
-struct sigaction signalHandler;                                                             // signal handler for Round Robin
-
-enum threadStatus {RUNNING, READY, EXITED, AVAILABLE, BLOCKED};                                      // thread states
+enum threadStatus {RUNNING, READY, EXITED, AVAILABLE, BLOCKED};                             // thread states
 
 struct threadControlBlock {                                                                 // thread control block
-    int id;                                                                                 // thread ID
+    pthread_t id;                                                                           // thread ID
     jmp_buf registers;                                                                      // from setjmp.h: "__extension__ typedef long long int __jmp_buf[8];"
     void* stack;                                                                            // stack pointer
     enum threadStatus status;                                                               // thread state
+
+    int woken;                                                                              // flag for if thread just woken
+    int initialized;                                                                        // flag for if thread just initialized
+    void* exitStatus;                                                                       // pointer to exit status
 };
 
-struct threadControlBlock TCBTable[MAXTHREADS];                                             // table/array to store TCBs 
+struct semaphoreControlBlock {
+    int counter;                                                                            // semaphore counter
+    struct Queue* roundRobinQueue;                                                          // queue to store threads
+    int initialized;                 
+};
 
-int pthread_create(
+void pthread_exit_wrapper() {
+    unsigned long int res;
+    asm("movq %%rax, %0\n":"=r"(res));
+    pthread_exit((void *) res);
+}
+
+struct threadControlBlock TCBTable[MAXTHREADS];                                             // table/array to store TCBs 
+pthread_t gCurrent = 0;                                                                     // global ID of current running thread
+struct sigaction signalHandler;                                                             // signal handler for Round Robin                      
+
+void initializeTCB() {
+    int i;              
+    for (i = 0; i < MAXTHREADS; i++) {                                                  // initialize values in TCB table
+        TCBTable[i].id = i;             
+        TCBTable[i].status = AVAILABLE;             
+        TCBTable[i].initialized = 0;
+        TCBTable[i].woken = 0;
+    }               
+
+    ualarm(QUANTUM, QUANTUM);                                                           // SIGALARM every 50 ms
+
+    sigemptyset(&signalHandler.sa_mask);                                                // initialize signal set
+    signalHandler.sa_handler = &schedule;                                               // pointer to signal handling function (schedule)
+    signalHandler.sa_flags = SA_NODEFER;                                                // do not prevent signal from being received within own signal handler                
+    sigaction(SIGALRM, &signalHandler, NULL);                                           // handle alarm signal and schedule
+}
+
+extern int pthread_create(
     pthread_t *thread, 
     const pthread_attr_t *attr, 
-    void *(*start_routine)(void *), 
+    void *(*start_routine) (void *), 
     void *arg) {
 
+    static int firstThread = 1;                                                             // flag for initializing scheduler
     attr = NULL;                                                                            // "In our implementation, the second argument (attr) shall always be NULL"
+    int mainThread = 0;                                                                     // flag for main program
 
-    if (firstThread) {                                                                      // set up data sctructures and scheduler             
-        int i;              
-        for (i = 0; i < MAXTHREADS; i++) {                                                  // initialize values in TCB table
-            TCBTable[i].id = i;             
-            TCBTable[i].status = AVAILABLE;             
-        }               
+    if (firstThread) {
+        initializeTCB();
 
-        ualarm(QUANTUM, QUANTUM);                                                           // SIGALARM every 50 ms
-
-        sigemptyset(&signalHandler.sa_mask);                                                // initialize signal set
-        signalHandler.sa_handler = &schedule;                                               // pointer to signal handling function (schedule)
-        signalHandler.sa_flags = SA_NODEFER;                                                // do not prevent signal from being received within own signal handler                
-        sigaction(SIGALRM, &signalHandler, NULL);                                           // handle alarm signal and schedule
-             
         firstThread = 0;                                                                    // unset flag 
         TCBTable[0].status = READY;                                                         // set status of first thread as ready
+        TCBTable[0].initialized = 1;                                                        // set initialized flag
+        mainThread = setjmp(TCBTable[0].registers);                                         // save context
+    }
 
-    }                           
-
-    pthread_t tidCurrent = 1;
-    while (TCBTable[tidCurrent].status != AVAILABLE) {                                      // iterate through TCB table to find next available thread
-        if (tidCurrent > MAXTHREADS) {
-            perror("ERROR: Reached maximum threads supported\n");                           // error if maximum number of threads exceeded
-        }
-        else {
+    if (!mainThread) {
+        pthread_t tidCurrent = 1;
+        while(TCBTable[tidCurrent].status != AVAILABLE && tidCurrent < MAXTHREADS) {
             tidCurrent++;
         }
+        if (tidCurrent == MAXTHREADS) {
+            fprintf(stderr, "ERROR: Reached maximum threads supported\n");
+            exit(EXIT_FAILURE);
+        }
+        
+        *thread = tidCurrent;                                                                   
+
+        setjmp(TCBTable[tidCurrent].registers);                                                 // save current thread context
+
+        TCBTable[tidCurrent].stack = malloc(STACKSIZE);                                         // allocate 32,767 bytes for new thread stack
+        void* stackBottom = STACKSIZE + TCBTable[tidCurrent].stack;                             // set pointer to top of stack
+
+        void* stackPointer = stackBottom - 8;                                                   // update stack pointer
+        void (*newStack)(void*) = &pthread_exit_wrapper;                                              
+        stackPointer = memcpy(stackPointer, &newStack, sizeof(newStack)); 
+
+        TCBTable[tidCurrent].registers[0].__jmpbuf[JB_PC] = ptr_mangle((unsigned long int)start_thunk);      // decrypt 
+        TCBTable[tidCurrent].registers[0].__jmpbuf[JB_R13] = (unsigned long int)arg;                         // store arg in register R13
+        TCBTable[tidCurrent].registers[0].__jmpbuf[JB_R12] = (unsigned long int)start_routine;               // store address of start_routine function in register R12
+        TCBTable[tidCurrent].registers[0].__jmpbuf[JB_RSP] = ptr_mangle((unsigned long int)stackPointer);    
+
+        TCBTable[tidCurrent].initialized = 1;
+        TCBTable[tidCurrent].id = tidCurrent;                                                   // set ID of new thread
+        TCBTable[tidCurrent].status = READY;                                                    // set status to ready
+
+        schedule();                                                                             // call scheduler
     }
-    *thread = tidCurrent;                                                                   
-
-    setjmp(TCBTable[tidCurrent].registers);                                                 // save current thread context
-
-    TCBTable[tidCurrent].registers[0].__jmpbuf[JB_PC] = ptr_mangle((long)start_thunk);      // decrypt 
-    TCBTable[tidCurrent].registers[0].__jmpbuf[JB_R13] = (long)arg;                         // store arg in register R13
-    TCBTable[tidCurrent].registers[0].__jmpbuf[JB_R12] = (long)start_routine;               // store address of start_routine function in register R12
-
-    TCBTable[tidCurrent].stack = malloc(STACKSIZE);                                         // allocate 32,767 bytes for new thread stack
-    void* stackBottom = STACKSIZE + TCBTable[tidCurrent].stack;                             // set pointer to top of stack
-
-    void* stackPointer = stackBottom - sizeof(&pthread_exit);                               // update stack pointer
-    void (*temp)(void*) = (void*)&pthread_exit;                                              
-    stackPointer = memcpy(stackPointer, &temp, sizeof(temp));                               
-    TCBTable[tidCurrent].registers[0].__jmpbuf[JB_RSP] = ptr_mangle((long)stackPointer);    
-
-    TCBTable[tidCurrent].id = tidCurrent;                                                   // set ID of new thread
-    TCBTable[tidCurrent].status = READY;                                                    // set status to ready
-
-    schedule();                                                                             // call scheduler
-
+    else {   
+        mainThread = 0;
+    }
+    
     return 0;
 }
 
-void schedule() {
-    if (TCBTable[gCurrent].status == RUNNING) {                                             // suspend current thread
-        TCBTable[gCurrent].status = READY;                      
+void schedule() {        
+    if(TCBTable[gCurrent].status == RUNNING) {
+        TCBTable[gCurrent].status = READY;
     }
 
     pthread_t tidCurrent = gCurrent + 1;
@@ -109,19 +138,23 @@ void schedule() {
     }
 
     int save = 0;
-    if(TCBTable[gCurrent].status != EXITED) {
-        save = setjmp(TCBTable[gCurrent].registers);                                        // 
+
+    if (TCBTable[gCurrent].initialized == 0  && TCBTable[gCurrent].status != EXITED) {
+        save = setjmp(TCBTable[gCurrent].registers);
+    }
+    
+    if (TCBTable[tidCurrent].initialized) {
+        TCBTable[tidCurrent].initialized = 0;
     }
 
     if (!save) {
         gCurrent = tidCurrent;
         TCBTable[gCurrent].status = RUNNING;
-        longjmp(TCBTable[gCurrent].registers, 1);                                           
+        longjmp(TCBTable[gCurrent].registers, 1);
     }
-
 }
 
-void exitCleanup() {                                                                        // clean up remaining threads
+extern void exitCleanup() {                                                                        // clean up remaining threads
     int i;
     for (i = 0; i < MAXTHREADS; i++) {                                                      // iterate through TCB table
         if (TCBTable[i].status == EXITED) {                                                 // check if thread has exited
@@ -131,22 +164,194 @@ void exitCleanup() {                                                            
     }
 }
 
-void pthread_exit(void *retval) {                                                           // 
-    TCBTable[gCurrent].status = EXITED; 
+extern void pthread_exit(void *value_ptr) {
+    TCBTable[gCurrent].status = EXITED;
+    TCBTable[gCurrent].exitStatus = value_ptr;
 
-    exitCleanup();                                                                          
+    pthread_t tidWaiting = TCBTable[gCurrent].id;
+    if (tidWaiting != gCurrent) {
+        TCBTable[tidWaiting].status = READY;
+    }
 
-    int i;  
-    for (i = 0; i < MAXTHREADS; i++) {                                                      // call scheduler if any threads are waiting
-        if (TCBTable[i].status == READY) {  
-            schedule(); 
-            break;  
-        }   
-    }   
+    int threadsRemaining = 0;
+    int i;
+    for (i = 0; i < MAXTHREADS; i++) {
+        switch(TCBTable[i].status) {
+            case READY   :
+            case RUNNING :
+            case BLOCKED :
+                threadsRemaining = 1;
+                break;
+            case EXITED:
+            case AVAILABLE:
+                break;
+        }
+    }
 
-    exit(0);                                                                                // exit if no threads left
-}   
+    if (threadsRemaining) {                                                                 // call schedule if threads still in queue
+        schedule();
+    }
 
-pthread_t pthread_self() {                                                                  // return ID of current running thread
+    exitCleanup();
+    exit(0);
+}
+
+extern pthread_t pthread_self() {
     return gCurrent;
 }
+
+////////////////////////////////////////////////////////// Queue implementation //////////////////////////////////////////////////////////
+
+struct Node { 
+    pthread_t key;                                                                      // ID of thread in queue
+    struct Node* next;                                                                  // next thread in queue
+}; 
+  
+struct Queue { 
+    struct Node *start;                                                                 // first entry in queue
+    struct Node *end;                                                                   // last entry in queue
+}; 
+  
+struct Node* newNode(pthread_t value) {                                                     // function to create new queue entry 
+    struct Node* newStack = (struct Node*)malloc(sizeof(struct Node));                      
+    newStack->key = value; 
+    newStack->next = NULL; 
+    return newStack; 
+} 
+  
+struct Queue* createQueue() {                                                           // function to create an empty queue 
+    struct Queue* q = (struct Queue*)malloc(sizeof(struct Queue)); 
+    q->start = q->end = NULL; 
+    return q; 
+} 
+  
+void enQueue(struct Queue* q, pthread_t value) {                                        // function to push key k to queue
+    
+    struct Node* newStack = newNode(value);                                                 // create a new entry 
+
+    if (q->end == NULL) {                                                               // if queue is empty, set start and end to new node 
+        q->start = q->end = newStack; 
+        return; 
+    } 
+   
+    q->end->next = newStack;                                                                // update end pointer
+    q->end = newStack; 
+} 
+   
+pthread_t deQueue(struct Queue* q) {                                                      // function to pop key from queue
+    if (q->start == NULL)                                                               // if queue is empty, return NULL
+        return (pthread_t) - 1; 
+   
+    struct Node* newStack = q->start;                                                       // update start pointer
+  
+    q->start = q->start->next; 
+
+    if (q->start == NULL)                                                               // if start becomes NULL, also set end to NULL 
+        q->end = NULL; 
+  
+    return newStack->key;
+} 
+
+////////////////////////////////////////////////////////// Synchronization implementation //////////////////////////////////////////////////////////
+
+extern void lock() {
+    sigset_t set;
+    sigemptyset (&set);
+    sigaddset(&set, SIGALRM);
+    sigprocmask(SIG_BLOCK, &set, NULL);
+}
+
+extern void unlock() {
+    sigset_t set;
+    sigemptyset (&set);
+    sigaddset(&set, SIGALRM);
+    sigprocmask(SIG_UNBLOCK, &set, NULL);
+}
+
+extern int pthread_join(pthread_t thread, void** value_ptr) {
+    switch(TCBTable[thread].status)
+    {
+        case READY   :
+        case RUNNING :
+        case BLOCKED :        
+            TCBTable[gCurrent].status = BLOCKED;
+            TCBTable[thread].id = gCurrent;
+	        schedule();
+        case EXITED:
+            if (value_ptr != NULL) {
+                *value_ptr = TCBTable[thread].exitStatus;
+            }
+            free(TCBTable[thread].stack);
+            TCBTable[thread].status = AVAILABLE;
+            break;
+        case AVAILABLE:
+            return 1; 
+            break;
+    }
+    return 0;
+}
+
+extern int sem_init(sem_t *sem, int pshared, unsigned value) {                                // initialize semaphore
+    struct semaphoreControlBlock* SCB = (struct semaphoreControlBlock*) malloc(sizeof(struct semaphoreControlBlock));
+
+    SCB->counter = value;                                                                         // initial value of semaphore
+    SCB->roundRobinQueue = createQueue();                                                        // create new queue
+    SCB->initialized = 1;
+
+    sem->__align = (unsigned long int) SCB;
+
+    return 0;
+}
+
+extern int sem_wait(sem_t *sem) {                                                             // locks semaphore
+    struct semaphoreControlBlock* SCB = (struct semaphoreControlBlock*) (sem->__align);
+
+    if (SCB->counter <= 0) {
+        TCBTable[gCurrent].status = BLOCKED;
+        enQueue(SCB->roundRobinQueue, gCurrent);
+        schedule();
+    }
+    else {
+        (SCB->counter)--;
+        return 0;
+    }
+    if (TCBTable[gCurrent].woken) {
+        TCBTable[gCurrent].woken = 0;
+
+        return 0;
+    }
+
+    return -1;                                                                                  // error
+}
+
+extern int sem_post(sem_t *sem) {                                                             // unlocks/increments semaphore
+    struct semaphoreControlBlock* SCB = (struct semaphoreControlBlock*)(sem->__align);
+
+    if ((SCB->counter) >= 0) {
+        pthread_t nextThread = deQueue(SCB->roundRobinQueue);                                   // pop next thread from queue
+
+        if (nextThread != -1) {                                                                 // queue not empty
+            TCBTable[nextThread].woken = 1;                                                     // wake up thread
+            TCBTable[nextThread].status = READY;                                                // thread ready
+        }
+        else {
+            (SCB->counter)++;                                                                   // queue empty
+        }
+        unlock();
+        return 0;
+    }
+    return -1;                                                                                  // error
+}   
+
+extern int sem_destroy(sem_t *sem) {                                                            // destroy semaphore
+     struct semaphoreControlBlock* SCB = (struct semaphoreControlBlock*) (sem->__align);
+
+     if (SCB->initialized) {
+        free((void*)(sem->__align));
+     }
+     else {
+        return -1;                                                                              // error
+     }
+     return 0;
+}
+
