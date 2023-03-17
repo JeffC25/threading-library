@@ -1,5 +1,5 @@
-#ifndef __EC440THREADS__
-#define __EC440THREADS__
+#ifndef __ASMWRAPPERS__
+#define __ASMWRAPPERS__
 
 unsigned long int ptr_demangle(unsigned long int p)
 {

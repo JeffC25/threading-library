@@ -1,4 +1,4 @@
-#include "ec440threads.h"
+#include "asm_wrappers.h"
 #include <stdio.h>
 #include <pthread.h>
 #include <setjmp.h>
