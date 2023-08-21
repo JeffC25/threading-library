@@ -1,6 +1,5 @@
 #include "asm_wrappers.h"
 #include <stdio.h>
-#include <pthread.h>
 #include <setjmp.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -27,7 +26,7 @@
 enum threadStatus {RUNNING, READY, EXITED, AVAILABLE, BLOCKED};                             // thread states
 
 struct threadControlBlock {                                                                 // thread control block
-    pthread_t id;                                                                           // thread ID
+    int id;                                                                           // thread ID
     jmp_buf registers;                                                                      // from setjmp.h: "__extension__ typedef long long int __jmp_buf[8];"
     void* stack;                                                                            // stack pointer
     enum threadStatus status;                                                               // thread state
@@ -50,7 +49,7 @@ void pthread_exit_wrapper() {
 }
 
 struct threadControlBlock TCBTable[MAXTHREADS];                                             // table/array to store TCBs 
-pthread_t gCurrent = 0;                                                                     // global ID of current running thread
+int gCurrent = 0;                                                                     // global ID of current running thread
 struct sigaction signalHandler;                                                             // signal handler for Round Robin                      
 
 void initializeTCB() {
@@ -71,8 +70,8 @@ void initializeTCB() {
 }
 
 extern int pthread_create(
-    pthread_t *thread, 
-    const pthread_attr_t *attr, 
+    int *thread, 
+    const int *attr, 
     void *(*start_routine) (void *), 
     void *arg) {
 
@@ -90,7 +89,7 @@ extern int pthread_create(
     }
 
     if (!mainThread) {
-        pthread_t tidCurrent = 1;
+        int tidCurrent = 1;
         while(TCBTable[tidCurrent].status != AVAILABLE && tidCurrent < MAXTHREADS) {
             tidCurrent++;
         }
@@ -133,7 +132,7 @@ void schedule() {
         TCBTable[gCurrent].status = READY;
     }
 
-    pthread_t tidCurrent = gCurrent + 1;
+    int tidCurrent = gCurrent + 1;
     while(TCBTable[tidCurrent].status != READY) {                                           // cycle through TCB table until finding ready thread
         tidCurrent = (tidCurrent + 1) % MAXTHREADS;
     }
@@ -169,7 +168,7 @@ extern void pthread_exit(void *value_ptr) {
     TCBTable[gCurrent].status = EXITED;
     TCBTable[gCurrent].exitStatus = value_ptr;
 
-    pthread_t tidWaiting = TCBTable[gCurrent].id;
+    int tidWaiting = TCBTable[gCurrent].id;
     if (tidWaiting != gCurrent) {
         TCBTable[tidWaiting].status = READY;
     }
@@ -197,7 +196,7 @@ extern void pthread_exit(void *value_ptr) {
     exit(0);
 }
 
-extern pthread_t pthread_self() {
+extern int pthread_self() {
     return gCurrent;
 }
 
@@ -215,7 +214,7 @@ extern void unlock() {
     sigprocmask(SIG_UNBLOCK, &set, NULL);
 }
 
-extern int pthread_join(pthread_t thread, void** value_ptr) {
+extern int pthread_join(int thread, void** value_ptr) {
     switch(TCBTable[thread].status)
     {
         case READY   :
@@ -275,7 +274,7 @@ extern int sem_post(sem_t *sem) {                                               
     struct semaphoreControlBlock* SCB = (struct semaphoreControlBlock*)(sem->__align);
 
     if ((SCB->counter) >= 0) {
-        pthread_t nextThread = deQueue(SCB->roundRobinQueue);                                   // pop next thread from queue
+        int nextThread = deQueue(SCB->roundRobinQueue);                                   // pop next thread from queue
 
         if (nextThread != -1) {                                                                 // queue not empty
             TCBTable[nextThread].woken = 1;                                                     // wake up thread
