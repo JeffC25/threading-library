@@ -1,2 +1,2 @@
-# threading-library
-Simple user-level multithreading system for Linux created in C
+# Threading Library
+Lightweight user-level multithreading system for Linux created in C
